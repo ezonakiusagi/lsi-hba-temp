@@ -1,0 +1,11 @@
+[Unit]
+Description=LSI HBA Temperature Monitoring Daemon
+After=syslog.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/lsi-hba-temp --systemd
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

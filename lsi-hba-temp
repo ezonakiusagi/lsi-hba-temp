@@ -1,0 +1,816 @@
+#!/bin/bash
+# ==============================================================================
+# Script Name:  lsi-hba-temp
+# Description:  A lightweight, robust hardware monitoring utility that polls and
+#               evaluates real-time temperatures for Broadcom / LSI storage 
+#               controllers (HBAs). Supports ad-hoc queries, interactive 
+#               intervals, and native systemd or standalone background daemons.
+# Author:       The Art of Server
+# Contact:      the.art.of.server@gmail.com
+# ==============================================================================
+# Copyright (C) 2026 Art of Server <the.art.of.server@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.  
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. Hardcoded Configuration Defaults (Fallbacks)
+# ------------------------------------------------------------------------------
+# Temperature thresholds
+DEFAULT_WARN_TEMP=65
+DEFAULT_CRIT_TEMP=80
+# Default log mode, file, and PID file (for daemon mode)
+DEFAULT_LOG_MODE="console"
+DEFAULT_LOG_FILE="/var/log/lsi-hba-temp.log"
+DEFAULT_PID_FILE="/var/run/lsi-hba-temp.pid"
+# Default internal
+DEFAULT_INTERVAL=60
+
+# Initialize binary configuration variables to ensure they exist
+CONF_LSIUTIL=""
+CONF_STORCLI=""
+CONF_STORCLI2=""
+REQUIRE_LSIUTIL=0
+REQUIRE_STORCLI=0
+REQUIRE_STORCLI2=0
+
+# ------------------------------------------------------------------------------
+# 2. Configuration File Discovery & Loading
+# ------------------------------------------------------------------------------
+if [[ "${BASH_SOURCE[0]}" == */* ]]; then
+    SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
+else
+    SCRIPT_DIR="."
+fi
+
+if [[ "$SCRIPT_DIR" != /* ]]; then
+    SCRIPT_DIR="$PWD/$SCRIPT_DIR"
+fi
+
+CONFIG_LOOKUP_PATHS=(
+    "${SCRIPT_DIR}/lsi-hba-temp.conf"
+    "/etc/lsi-hba-temp.conf"
+    "/usr/local/etc/lsi-hba-temp.conf"
+)
+
+CONFIG_FOUND=""
+for path in "${CONFIG_LOOKUP_PATHS[@]}"; do
+    if [[ -f "$path" ]]; then
+        CONFIG_FOUND="$path"
+        break
+    fi
+done
+
+if [[ -n "$CONFIG_FOUND" ]]; then
+    source "$CONFIG_FOUND"
+    CONF_LSIUTIL="$LSIUTIL"
+    CONF_STORCLI="$STORCLI"
+    CONF_STORCLI2="$STORCLI2"
+else
+    WARN_TEMP=$DEFAULT_WARN_TEMP
+    CRIT_TEMP=$DEFAULT_CRIT_TEMP
+    LOG_MODE=$DEFAULT_LOG_MODE
+    LOG_FILE=$DEFAULT_LOG_FILE
+    PID_FILE=$DEFAULT_PID_FILE
+    INTERVAL=$DEFAULT_INTERVAL
+fi
+
+[[ "$INTERVAL" =~ ^[0-9]+$ ]] && (( INTERVAL > 0 )) || INTERVAL=$DEFAULT_INTERVAL
+[[ "$WARN_TEMP" =~ ^[0-9]+$ ]] || WARN_TEMP=$DEFAULT_WARN_TEMP
+[[ "$CRIT_TEMP" =~ ^[0-9]+$ ]] || CRIT_TEMP=$DEFAULT_CRIT_TEMP
+
+# ------------------------------------------------------------------------------
+# 3. Binary Resolution (Config Override vs System PATH Discovery)
+# ------------------------------------------------------------------------------
+LSIUTIL="${CONF_LSIUTIL:-$(command -v lsiutil)}"
+STORCLI="${CONF_STORCLI:-$(command -v storcli64)}"
+STORCLI2="${CONF_STORCLI2:-$(command -v storcli2)}"
+
+[[ -z "$CONF_LSIUTIL" && ! -x "$LSIUTIL" ]] && LSIUTIL=""
+[[ -z "$CONF_STORCLI" && ! -x "$STORCLI" ]] && STORCLI=""
+[[ -z "$CONF_STORCLI2" && ! -x "$STORCLI2" ]] && STORCLI2=""
+
+# ------------------------------------------------------------------------------
+# 4. Global Runtime State & Maps
+# ------------------------------------------------------------------------------
+RUN_LOOP=0  
+
+declare -A PCI_MAP=(
+    [0058]="SAS1068E|SAS1|NA"
+
+    [0064]="SAS2116|SAS2|NA"
+    [0070]="SAS2004|SAS2|NA"
+    [0072]="SAS2008|SAS2|NA"
+    [3050]="SAS2008|SAS2|NA"
+    
+    [0086]="SAS2308|SAS2|lsiutil"
+    [0087]="SAS2308|SAS2|lsiutil"
+
+    [0096]="SAS3004|SAS3|lsiutil"
+    [0097]="SAS3008|SAS3|lsiutil"
+    [00c4]="SAS3224|SAS3|lsiutil"
+    [00c9]="SAS3216|SAS3|lsiutil"
+
+    [00af]="SAS3408|SAS3|lsiutil"
+    [00ac]="SAS3416|SAS3|lsiutil"
+    [00d1]="SAS3616|SAS3|lsiutil"
+
+    [00e6]="SAS38xx|SAS4|lsiutil"
+
+    # normally, prefer storcli, but storcli
+    # has strange delay before output. lsiutil is faster
+    #[00ac]="SAS3416|SAS3|storcli"
+    #[00af]="SAS3408|SAS3|storcli"
+    #[00d1]="SAS3616|SAS3|storcli"
+
+    #[00e6]="SAS38xx|SAS4|storcli"
+
+    [00a5]="SAS40xx|SAS4|storcli2"
+)
+
+declare -a CONTROLLERS
+declare -A PCI_TO_CTRL
+declare -A PCI_TO_PORT
+
+# ------------------------------------------------------------------------------
+# 5. Centralized Message Broker
+# ------------------------------------------------------------------------------
+send_msg() {
+    local level="$1"      # DEBUG, INFO, WARNING, ERROR, DATA
+    local msg="$2"
+    local raw_status="$3" # Optional: status token (ok/warning/critical) for console color
+    
+    local timestamp
+    printf -v timestamp '%(%Y-%m-%d %H:%M:%S)T' -1
+
+    case "$LOG_MODE" in
+        console)
+            local GREEN='\033[0;32m'
+            local YELLOW='\033[1;33m'
+            local RED='\033[0;31m'
+            local NC='\033[0m'
+            
+            if [[ -n "$raw_status" ]]; then
+                local raw_temp="${msg##*temp_c=}"
+                raw_temp="${raw_temp%% status*}"
+
+                case "$raw_status" in
+                    ok)
+                        msg="${msg//status=ok/status=${GREEN}ok${NC}}"
+                        [[ "$msg" == *"temp_c=$raw_temp"* ]] && msg="${msg//temp_c=$raw_temp/temp_c=${GREEN}$raw_temp${NC}}"
+                        ;;
+                    warning)
+                        msg="${msg//status=warning/status=${YELLOW}warning${NC}}"
+                        [[ "$msg" == *"temp_c=$raw_temp"* ]] && msg="${msg//temp_c=$raw_temp/temp_c=${YELLOW}$raw_temp${NC}}"
+                        ;;
+                    critical)
+                        msg="${msg//status=critical/status=${RED}critical${NC}}"
+                        [[ "$msg" == *"temp_c=$raw_temp"* ]] && msg="${msg//temp_c=$raw_temp/temp_c=${RED}$raw_temp${NC}}"
+                        ;;
+                esac
+            fi
+
+            if [[ "$level" == "ERROR" || "$level" == "WARNING" || "$level" == "DEBUG" ]]; then
+                echo -e "[$timestamp] [$level] $msg" >&2
+            else
+                echo -e "$msg"
+            fi
+            ;;
+
+        file)
+            local formatted_msg="[$timestamp] [$level] $msg"
+            if touch "$LOG_FILE" 2>/dev/null; then
+                echo "$formatted_msg" >> "$LOG_FILE"
+            else
+                echo "[$timestamp] [ERROR] Cannot write to $LOG_FILE. Falling back to stderr." >&2
+                echo "$formatted_msg" >&2
+            fi
+            ;;
+
+        syslog)
+            case "$level" in
+                ERROR)   logger -t lsi-hba-temp -p user.err "[$level] $msg" ;;
+                WARNING) logger -t lsi-hba-temp -p user.warning "[$level] $msg" ;;
+                DEBUG)   logger -t lsi-hba-temp -p user.debug "[$level] $msg" ;;
+                *)       logger -t lsi-hba-temp -p user.info "[$level] $msg" ;;
+            esac
+            ;;
+    esac
+}
+
+# ------------------------------------------------------------------------------
+# 6. Help Menu
+# ------------------------------------------------------------------------------
+usage() {
+    printf '%s\n' \
+"Usage: $(basename "$0") [OPTIONS]" \
+"" \
+"Options:" \
+"    -i, --interval <sec>   Run continuously at specified update interval." \
+"    -o, --output <dest>    Set output destination: console, file, syslog" \
+"    --systemd              Run foreground pipeline managed by systemd (forces syslog output)." \
+"    -d, --daemon           Run as a standalone background POSIX daemon." \
+"    -s, --stop             Stop a running standalone background daemon instance." \
+"    -h, --help             Display this help text." \
+""
+    exit 1
+}
+
+# ------------------------------------------------------------------------------
+# 7. Standalone POSIX Daemon Control Mechanics
+# ------------------------------------------------------------------------------
+start_standalone_daemon() {
+    if [[ -f "$PID_FILE" ]]; then
+        local current_pid
+        current_pid=$(< "$PID_FILE")
+        if [[ -n "$current_pid" ]] && kill -0 "$current_pid" 2>/dev/null; then
+            send_msg "ERROR" "Standalone daemon is already running under PID: $current_pid"
+            exit 1
+        fi
+    fi
+
+    send_msg "INFO" "Initializing background POSIX daemon..."
+
+    # FIRST FORK: Break parent session mapping using setsid if available
+    if command -v setsid &>/dev/null; then
+        setsid "$0" --daemon-exec-stg1 &
+    else
+        send_msg "WARNING" "setsid utility missing. Daemon session decoupling may be incomplete."
+        "$0" --daemon-exec-stg1 &
+    fi
+
+    exit 0
+}
+
+stop_standalone_daemon() {
+    if [[ ! -f "$PID_FILE" ]]; then
+        echo "Error: No PID tracker tracking file located at $PID_FILE." >&2
+        exit 1
+    fi
+
+    local target_pid
+    target_pid=$(< "$PID_FILE")
+    if [[ -z "$target_pid" ]]; then
+        echo "Error: Tracking file empty. Clearing dead link descriptor..." >&2
+        rm -f "$PID_FILE"
+        exit 1
+    fi
+
+    echo "Signaling shutdown execution queue to daemon (PID: $target_pid)..."
+    kill -15 "$target_pid" 2>/dev/null
+
+    for i in {1..10}; do
+        if ! kill -0 "$target_pid" 2>/dev/null; then
+            echo "Daemon process stopped cleanly."
+            rm -f "$PID_FILE"
+            exit 0
+        fi
+        sleep 0.5
+    done
+
+    echo "Warning: Daemon did not stop within grace window. Forcing SIGKILL..."
+    kill -9 "$target_pid" 2>/dev/null
+    rm -f "$PID_FILE"
+    exit 0
+}
+
+# ------------------------------------------------------------------------------
+# 8. Signal Traps
+# ------------------------------------------------------------------------------
+handle_shutdown_signal() {
+    # stop loop
+    RUN_LOOP=0
+    # log a message
+    if [[ "$LOG_MODE" == "syslog" || "$LOG_MODE" == "file" ]]; then
+        send_msg "INFO" "Shutdown signal intercepted. Clearing execution queue..."
+    fi
+    # remove PID file if exists
+    if [[ -f "$PID_FILE" ]]; then
+        rm -f "$PID_FILE"
+    fi
+}
+
+trap 'handle_shutdown_signal' SIGTERM SIGINT
+
+# ------------------------------------------------------------------------------
+# 9. Command Line Argument Processing Shell
+# ------------------------------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --systemd)
+            LOG_MODE="syslog"
+            RUN_LOOP=1
+            shift
+            ;;
+        -d|--daemon)
+            LOG_MODE="syslog"
+            start_standalone_daemon
+            ;;
+        --daemon-exec-stg1)
+            # ---- STAGE 1 FORK (Session Leader Context) ----
+            # SECOND FORK: Spawn the true isolated worker daemon grandchild process.
+            "$0" --daemon-exec-final &
+            exit 0
+            ;;
+        --daemon-exec-final)
+            # ---- STAGE 2 FORK (True Grandchild Daemon Context) ----
+            LOG_MODE="syslog"
+            RUN_LOOP=1
+            cd / || exit 1
+            umask 022
+
+            # Sever standard streams to complete process environment isolation
+            exec 0</dev/null
+            exec 1>/dev/null
+            exec 2>/dev/null
+
+            echo $BASHPID > "$PID_FILE"
+            shift
+            ;;
+        -s|--stop)
+            stop_standalone_daemon
+            ;;
+        -i|--interval)
+            if [[ -z "$2" || ! "$2" =~ ^[0-9]+$ ]]; then
+                echo "Error: Option $1 requires a valid numerical integer value." >&2
+                usage
+            fi
+            INTERVAL="$2"
+            RUN_LOOP=1
+            shift 2
+            ;;
+        -o|--output)
+            if [[ "$2" != "console" && "$2" != "file" && "$2" != "syslog" ]]; then
+                echo "Error: Invalid output mode verification parameter '$2'." >&2
+                usage
+            fi
+            LOG_MODE="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            echo "Error: Unrecognized option option sequence logic mapping: '$1'" >&2
+            usage
+            ;;
+    esac
+done
+
+# ------------------------------------------------------------------------------
+# 10. Hardware Query Layer & Evaluation
+# ------------------------------------------------------------------------------
+detect_controllers() {
+    local slot class vendor device
+    while IFS=$'\t' read -r tag value || [[ -n "$tag" ]]; do
+        case "${tag%:}" in
+            Slot)   slot="$value" ;;
+            Class)  class="$value" ;;
+            Vendor) vendor="$value" ;;
+            Device) 
+                device="$value"
+                if [[ "$vendor" == "1000" ]]; then
+                    if [[ "$class" == "0107" || ( "$class" == "0104" && -n "${PCI_MAP[$device]}" ) ]]; then
+                        if [[ -n "${PCI_MAP[$device]}" ]]; then
+                            IFS='|' read -r chip gen method <<< "${PCI_MAP[$device]}"
+                            echo "$slot|$chip|$gen|$method"
+                        fi
+                    fi
+                fi
+                ;;
+        esac
+    done < <(lspci -Dvmmn)
+}
+
+# ------------------------------------------------------------------------------
+# 11. Get lsiutil version
+# ------------------------------------------------------------------------------
+get_lsiutil_version() {
+    local binary_path="$1"
+    [[ -z "$binary_path" || ! -x "$binary_path" ]] && echo "0" && return 1
+    $binary_path -h 2>/dev/null | awk '/Version / {
+        for(i=1; i<=NF; i++) {
+            if($i ~ /Version/) {
+                gsub(/[^0-9.]/, "", $(i+1))
+                print $(i+1); exit
+            }
+        }
+    }'
+}
+
+# ------------------------------------------------------------------------------
+# 12. Get storcli64 version
+# ------------------------------------------------------------------------------
+get_storcli_version() {
+    local binary_path="$1"
+    [[ -z "$binary_path" || ! -x "$binary_path" ]] && echo "0" && return 1
+    $binary_path version nolog 2>/dev/null | awk '/Ver / {
+        for(i=1; i<=NF; i++) {
+            if($i ~ /^[0-9]+\.[0-9]+/) {
+                print $i; exit
+            }
+        }
+    }'
+}
+
+# ------------------------------------------------------------------------------
+# 13. Get storcli2 version
+# ------------------------------------------------------------------------------
+get_storcli2_version() {
+    local binary_path="$1"
+    [[ -z "$binary_path" || ! -x "$binary_path" ]] && echo "0" && return 1
+    $binary_path version nolog 2>/dev/null | awk '/Ver / {
+        for(i=1; i<=NF; i++) {
+            if($i ~ /^[0-9]+\.[0-9]+/) {
+                print $i; exit
+            }
+        }
+    }'
+}
+
+# ------------------------------------------------------------------------------
+# 14. Preflight checks
+# ------------------------------------------------------------------------------
+preflight_checks() {
+    local required_utils=(lspci awk id logger)
+    local missing_utils=()
+
+    for util in "${required_utils[@]}"; do
+        if ! command -v "$util" &>/dev/null; then
+            missing_utils+=("$util")
+        fi
+    done
+
+    if (( ${#missing_utils[@]} > 0 )); then
+        send_msg "ERROR" "The following required system utilities are missing: ${missing_utils[*]}"
+        send_msg "ERROR" "Please install them using your package manager (e.g., apt install pciutils awk)."
+        exit 1
+    fi
+
+    if [[ $(id -u) -ne 0 ]]; then
+        send_msg "WARNING" "Not running as root. Some utilities (lsiutil, storcli) may fail or return incomplete data."
+    fi
+
+    if [[ "$LOG_MODE" == "file" ]]; then
+        if [[ -z "$LOG_FILE" ]]; then
+            LOG_MODE="console"
+            send_msg "ERROR" "Log output mode set to 'file', but LOG_FILE is not configured or empty string."
+            exit 1
+        fi
+
+        if [[ -f "$LOG_FILE" ]]; then
+            if [[ ! -w "$LOG_FILE" ]]; then
+                LOG_MODE="console"
+                send_msg "ERROR" "Log file exists but is not writable: $LOG_FILE"
+                exit 1
+            fi
+        else
+            local log_dir="${LOG_FILE%/*}"
+            if [[ "$log_dir" == "$LOG_FILE" ]]; then
+                log_dir="."
+            fi
+
+            if [[ ! -d "$log_dir" ]]; then
+                LOG_MODE="console"
+                send_msg "ERROR" "Target log directory does not exist: $log_dir"
+                exit 1
+            fi
+            if [[ ! -w "$log_dir" ]]; then
+                LOG_MODE="console"
+                send_msg "ERROR" "Cannot create log file. Directory not writable: $log_dir"
+                exit 1
+            fi
+        fi
+    fi
+
+    CONTROLLERS=()
+    while read -r line || [[ -n "$line" ]]; do
+        CONTROLLERS+=("$line")
+    done < <(detect_controllers)
+
+    while IFS='|' read -r pci chip gen method || [[ -n "$pci" ]]; do
+        case "$method" in
+            lsiutil) REQUIRE_LSIUTIL=1 ;;
+            storcli) REQUIRE_STORCLI=1 ;;
+            storcli2) REQUIRE_STORCLI2=1 ;;
+        esac
+    done <<< "$(printf "%s\n" "${CONTROLLERS[@]}")"
+
+    if (( REQUIRE_LSIUTIL )) && [[ -z "$LSIUTIL" ]]; then
+        send_msg "ERROR" "lsiutil is required but not found in PATH."
+        send_msg "ERROR" "Install it or add it to PATH."
+        send_msg "ERROR" "Pre-compiled Linux binary can be found at:"
+        send_msg "ERROR" "  https://artofserver.com/downloads/lsi/utilities/linux/lsiutil "
+        exit 1
+    elif (( REQUIRE_LSIUTIL )) && [[ -n "$LSIUTIL" ]]; then
+        local LSIUTIL_VER
+        LSIUTIL_VER=$(get_lsiutil_version "$LSIUTIL")
+        send_msg "DEBUG" "Detected lsiutil version: $LSIUTIL_VER"
+    
+        case $LSIUTIL_VER in
+            1.72)
+                ;;
+            *)
+                send_msg "WARNING" "recommend using lsiutil version 1.72"
+                ;;
+        esac
+    fi
+
+    if (( REQUIRE_STORCLI )) && [[ -z "$STORCLI" ]]; then
+        send_msg "ERROR" "storcli64 is required but not found in PATH."
+        exit 1
+    elif (( REQUIRE_STORCLI )) && [[ -n "$STORCLI" ]]; then
+        local STORCLI_VER
+        STORCLI_VER=$(get_storcli_version "$STORCLI")
+        send_msg "DEBUG" "Detected StorCLI version: $STORCLI_VER"
+
+        case $STORCLI_VER in
+            007.1704.0000.0000)
+                send_msg "WARNING" "this version of storcli64 does not detect some SAS38xx controllers."
+                ;;
+            007.3305.0000.0000)
+                ;;
+            007.3503.0000.0000)
+                ;;
+            007.3603.0000.0000)
+                ;;
+            007.3703.0000.0000)
+                send_msg "WARNING" "this version of storcli64 may cause illegal instruction errors on older machines."
+                ;;
+            *)
+                send_msg "WARNING" "this version of storcli64 is unknown."
+                ;;
+        esac
+    fi
+    
+    if (( REQUIRE_STORCLI2 )) && [[ -z "$STORCLI2" ]]; then
+        send_msg "ERROR" "storcli2 is required but not found in PATH."
+        exit 1
+    elif (( REQUIRE_STORCLI2 )) && [[ -n "$STORCLI2" ]]; then
+        local STORCLI2_VER
+        STORCLI2_VER=$(get_storcli2_version "$STORCLI2")
+        send_msg "DEBUG" "Detected StorCLI2 version: $STORCLI2_VER"
+
+        case $STORCLI2_VER in
+            008.0008.0000.0010)
+                ;;
+            008.0012.0000.0004)
+                ;;
+            008.0016.0000.0011)
+                ;;
+            08.017.000.0008)
+                send_msg "WARNING" "this version of storcli2 may cause illegal instruction errors on older machines."
+                ;;
+            *)
+                send_msg "WARNING" "this version of storcli2 is unknown."
+                ;;
+        esac
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# 15. lsiutil PCI address combined format
+# ------------------------------------------------------------------------------
+pci_to_combined() {
+    local pci="$1"
+    IFS=':.' read -r domain bus dev fn <<< "$pci"
+    printf "%02x%02x%02x\n" $((16#$domain)) $((16#$bus)) $((16#$dev))
+}
+
+# ------------------------------------------------------------------------------
+# 16. Map PCI address to lsiutil port
+# ------------------------------------------------------------------------------
+map_lsiutil() {
+    [[ -z "$LSIUTIL" ]] && return
+
+    local max_ports
+    max_ports=$($LSIUTIL -s 2>/dev/null | awk '/MPT (Port|Ports) found/ {print $1}')
+    [[ -z "$max_ports" || ! "$max_ports" =~ ^[0-9]+$ ]] && return
+
+    for ((i=1; i<=max_ports; i++)); do
+        local combined
+        combined=$($LSIUTIL -p${i} -e 59 2>/dev/null | \
+            awk -F'combined:' '/combined:/ {gsub(/[^0-9a-fA-F]/,"",$2); print $2}')
+
+        if [[ -n "$combined" ]]; then
+            echo "$combined|$i"
+        fi
+    done
+}
+
+# ------------------------------------------------------------------------------
+# 17. Map PCI address to storcli64 controller number
+# ------------------------------------------------------------------------------
+map_storcli() {
+    $STORCLI show nolog 2>/dev/null | awk '
+        /^[[:space:]]*[0-9]+/ {
+            ctrl = $1
+            raw_pci = $NF
+
+            if (raw_pci ~ /^[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:/) {
+                raw_pci = "00" raw_pci
+            }
+
+            base_pci = substr(raw_pci, 1, 10)
+            func_hex = substr(raw_pci, 12)
+
+            sub(/^0+/, "", func_hex)
+            if (func_hex == "") func_hex = "0"
+
+            print base_pci "." func_hex "|" ctrl
+        }
+    '
+}
+
+# ------------------------------------------------------------------------------
+# 18. Map PCI address to storcli2 controller number
+# ------------------------------------------------------------------------------
+map_storcli2() {
+    $STORCLI2 /call show all nolog 2>/dev/null | awk '
+        /^Controller =/ { ctrl = $3 }
+
+        /^PCI Address =/ {
+            raw_pci = $4
+            split(raw_pci, parts, ":")
+
+            bus  = parts[2]
+            dev  = parts[3]
+            fn   = parts[4]
+
+            sub(/^0+/, "", fn)
+            if (fn == "") fn = "0"
+
+            domain = "0000"
+            print domain ":" bus ":" dev "." fn "|" ctrl
+        }
+    '
+}
+
+# ------------------------------------------------------------------------------
+# 19. Hardware Temperature Fetchers
+# ------------------------------------------------------------------------------
+get_temp_lsiutil() {
+    local port=$1
+    local raw=$($LSIUTIL -p${port} -a 25,2,0,0 2>/dev/null | \
+        awk -F'x' '/IOCTemperature:/ {print $2; exit}')
+
+    if [[ -n "$raw" ]]; then
+        echo "$((16#$raw))|ok"
+    else
+        echo "NA|no_sensor"
+    fi
+}
+
+get_temp_storcli() {
+    local ctrl=$1
+    local temp=$($STORCLI /c${ctrl} show all nolog 2>/dev/null | \
+        awk '/ROC temperature/ {print $NF; exit}')
+
+    if [[ -n "$temp" ]]; then
+        echo "$temp|ok"
+    else
+        echo "NA|no_sensor"
+    fi
+}
+
+get_temp_storcli2() {
+    local ctrl=$1
+    local temp=$($STORCLI2 /c${ctrl} show all nolog 2>/dev/null | \
+        awk -F'=' '/Chip temperature\(C\)/ {gsub(/[[:space:]]/,"",$2); print $2; exit}')
+
+    if [[ -n "$temp" && "$temp" =~ ^[0-9]+$ ]]; then
+        echo "$temp|ok"
+    else
+        echo "NA|no_sensor"
+    fi
+}
+
+get_status() {
+    local temp="$1"
+    [[ "$temp" =~ ^[0-9]+$ ]] || return 1
+
+    if (( temp >= CRIT_TEMP )); then
+        echo "critical"
+    elif (( temp >= WARN_TEMP )); then
+        echo "warning"
+    else
+        echo "ok"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# 20. Initialize Mapping Tables (Run ONCE at script start)
+# ------------------------------------------------------------------------------
+populate_maps() {
+    if (( REQUIRE_STORCLI )) && [[ -n "$STORCLI" ]]; then
+        while IFS='|' read -r pci ctrl || [[ -n "$pci" ]]; do
+            PCI_TO_CTRL[$pci]=$ctrl
+        done < <(map_storcli)
+    fi
+    if (( REQUIRE_STORCLI2 )) && [[ -n "$STORCLI2" ]]; then
+        while IFS='|' read -r pci ctrl || [[ -n "$pci" ]]; do
+            PCI_TO_CTRL[$pci]=$ctrl
+        done < <(map_storcli2)
+    fi
+    if (( REQUIRE_LSIUTIL )) && [[ -n "$LSIUTIL" ]]; then
+        while IFS='|' read -r combined_hex port_num || [[ -n "$combined_hex" ]]; do
+            PCI_TO_PORT[$combined_hex]=$port_num
+        done < <(map_lsiutil)
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# 21. Main Evaluation
+# ------------------------------------------------------------------------------
+run_once() {
+    for entry in "${CONTROLLERS[@]}"; do
+        local temp="NA"
+        local status="unknown"
+        local pci chip gen method
+        
+        IFS='|' read -r pci chip gen method <<< "$entry"
+
+        case "$method" in
+            NA)
+                temp="NA"
+                status="no_sensor"
+                ;;
+
+            lsiutil)
+                local lookup_hex=$(pci_to_combined "$pci")
+                local port=${PCI_TO_PORT[$lookup_hex]}
+                if [[ -n "$port" ]]; then
+                    IFS='|' read -r temp status <<< "$(get_temp_lsiutil "$port")"
+                else
+                    temp="NA"
+                    status="no_match"
+                fi
+                ;;
+
+            storcli)
+                local ctrl=${PCI_TO_CTRL[$pci]}
+                if [[ -n "$ctrl" ]]; then
+                    IFS='|' read -r temp status <<< "$(get_temp_storcli "$ctrl")"
+                else
+                    temp="NA"
+                    status="no_match"
+                fi
+                ;;
+
+            storcli2)
+                local ctrl=${PCI_TO_CTRL[$pci]}
+                if [[ -n "$ctrl" ]]; then
+                    IFS='|' read -r temp status <<< "$(get_temp_storcli2 "$ctrl")"
+                else
+                    temp="NA"
+                    status="no_match"
+                fi
+                ;;
+        esac
+
+        local raw_status="unknown"
+        if [[ "$temp" =~ ^[0-9]+$ ]]; then
+            raw_status=$(get_status "$temp")
+        elif [[ "$temp" == "NA" ]]; then
+            raw_status="$status"
+        fi
+
+        send_msg "DATA" "pci=$pci chip=$chip gen=$gen temp_c=$temp status=$raw_status" "$raw_status"
+    done
+}
+
+# ------------------------------------------------------------------------------
+# 22. Execution Pipeline Launch Engine (Foreground & Background Fall-Through)
+# ------------------------------------------------------------------------------
+preflight_checks
+populate_maps  
+
+# if this is ad-hoc run (RUN_LOOP=0), run once and exit
+[[ $RUN_LOOP -eq 0 ]] && run_once && exit 0
+
+# in RUN_LOOP=1 mode
+while [[ $RUN_LOOP -eq 1 ]] ; do
+    run_once
+    sleep "$INTERVAL" &
+    wait $! 2>/dev/null
+done
+
+# ------------------------------------------------------------------------------
+# 23. Exit block
+# ------------------------------------------------------------------------------
+if [[ "$LOG_MODE" == "syslog" || "$LOG_MODE" == "file" ]]; then
+    send_msg "INFO" "HBA temperature monitor terminated safely."
+fi
+
+exit 0
